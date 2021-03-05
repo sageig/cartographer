@@ -74,6 +74,30 @@ std::vector<PixelData> AccumulatePixelData(
   return accumulated_pixel_data;
 }
 
+std::vector<PixelData> AccumulatePixelData(
+    const int width, const int height, const Eigen::Array2i& min_index,
+    const Eigen::Array2i& max_index,
+    const std::vector<Eigen::Array4i>& voxel_indices_and_probabilities, bool is_height) {
+  std::vector<PixelData> accumulated_pixel_data(width * height);
+  for (const Eigen::Array4i& voxel_index_and_probability :
+       voxel_indices_and_probabilities) {
+    const Eigen::Array2i pixel_index = voxel_index_and_probability.head<2>();
+    if ((pixel_index < min_index).any() || (pixel_index > max_index).any()) {
+      // Out of bounds. This could happen because of floating point inaccuracy.
+      continue;
+    }
+    const int x = max_index.x() - pixel_index[0];
+    const int y = max_index.y() - pixel_index[1];
+    PixelData& pixel = accumulated_pixel_data[x * width + y];
+    ++pixel.count;
+    // std::cout << "Voxel index: " << voxel_index_and_probability[0] << "  " << voxel_index_and_probability[1] <<
+    //   "  " << voxel_index_and_probability[2] << std::endl;
+    pixel.min_z = voxel_index_and_probability[2];
+    pixel.max_z = voxel_index_and_probability[2];
+  }
+  return accumulated_pixel_data;
+}
+
 // The first three entries of each returned value are a cell_index and the
 // last is the corresponding probability value. We batch them together like
 // this to only have one vector and have better cache locality.
@@ -143,6 +167,22 @@ std::string ComputePixelValues(
   return cell_data;
 }
 
+std::string ComputePixelValues(
+    const std::vector<PixelData>& accumulated_pixel_data, bool is_height) {
+  std::string cell_data;
+  cell_data.reserve(2 * accumulated_pixel_data.size());
+  constexpr float kMinZDifference = 3.f;
+  constexpr float kFreeSpaceWeight = 0.15f;
+  for (const PixelData& pixel : accumulated_pixel_data) {
+    const int delta = pixel.max_z;
+    const uint8 alpha = delta > 0 ? 0 : -delta;
+    const uint8 value = delta > 0 ? delta : 0;
+    cell_data.push_back(value);                         // value
+    cell_data.push_back((value || alpha) ? alpha : 1);  // alpha
+  }
+  return cell_data;
+}
+
 void AddToTextureProto(
     const HybridGrid& hybrid_grid, const transform::Rigid3d& global_submap_pose,
     proto::SubmapQuery::Response::SubmapTexture* const texture) {
@@ -166,6 +206,38 @@ void AddToTextureProto(
   const std::vector<PixelData> accumulated_pixel_data = AccumulatePixelData(
       width, height, min_index, max_index, voxel_indices_and_probabilities);
   const std::string cell_data = ComputePixelValues(accumulated_pixel_data);
+
+  common::FastGzipString(cell_data, texture->mutable_cells());
+  *texture->mutable_slice_pose() = transform::ToProto(
+      global_submap_pose.inverse() *
+      transform::Rigid3d::Translation(Eigen::Vector3d(
+          max_index.x() * resolution, max_index.y() * resolution,
+          global_submap_pose.translation().z())));
+}
+
+void AddToTextureProto(
+    const HybridGrid& hybrid_grid, const transform::Rigid3d& global_submap_pose,
+    proto::SubmapQuery::Response::SubmapTexture* const texture, bool is_height) {
+  // Generate an X-ray view through the 'hybrid_grid', aligned to the
+  // xy-plane in the global map frame.
+  const float resolution = hybrid_grid.resolution();
+  texture->set_resolution(resolution);
+
+  // Compute a bounding box for the texture.
+  Eigen::Array2i min_index(INT_MAX, INT_MAX);
+  Eigen::Array2i max_index(INT_MIN, INT_MIN);
+  const std::vector<Eigen::Array4i> voxel_indices_and_probabilities =
+      ExtractVoxelData(hybrid_grid, global_submap_pose.cast<float>(),
+                       &min_index, &max_index);
+
+  const int width = max_index.y() - min_index.y() + 1;
+  const int height = max_index.x() - min_index.x() + 1;
+  texture->set_width(width);
+  texture->set_height(height);
+
+  const std::vector<PixelData> accumulated_pixel_data = AccumulatePixelData(
+      width, height, min_index, max_index, voxel_indices_and_probabilities, true);
+  const std::string cell_data = ComputePixelValues(accumulated_pixel_data,true);
 
   common::FastGzipString(cell_data, texture->mutable_cells());
   *texture->mutable_slice_pose() = transform::ToProto(
@@ -202,6 +274,8 @@ Submap3D::Submap3D(const float high_resolution, const float low_resolution,
           absl::make_unique<HybridGrid>(high_resolution)),
       low_resolution_hybrid_grid_(
           absl::make_unique<HybridGrid>(low_resolution)),
+      height_map_hybrid_grid_(
+          absl::make_unique<HybridGrid>(high_resolution)),
       high_resolution_intensity_hybrid_grid_(
           absl::make_unique<IntensityHybridGrid>(high_resolution)),
       rotational_scan_matcher_histogram_(rotational_scan_matcher_histogram) {}
@@ -223,6 +297,8 @@ proto::Submap Submap3D::ToProto(
         high_resolution_hybrid_grid().ToProto();
     *submap_3d->mutable_low_resolution_hybrid_grid() =
         low_resolution_hybrid_grid().ToProto();
+    *submap_3d->mutable_height_map_hybrid_grid() =
+        height_map_hybrid_grid().ToProto();
   }
   for (Eigen::VectorXf::Index i = 0;
        i != rotational_scan_matcher_histogram_.size(); ++i) {
@@ -243,6 +319,8 @@ void Submap3D::UpdateFromProto(const proto::Submap3D& submap_3d) {
   if (submap_3d.has_high_resolution_hybrid_grid()) {
     high_resolution_hybrid_grid_ =
         absl::make_unique<HybridGrid>(submap_3d.high_resolution_hybrid_grid());
+    height_map_hybrid_grid_ =
+        absl::make_unique<HybridGrid>(submap_3d.height_map_hybrid_grid());
   }
   if (submap_3d.has_low_resolution_hybrid_grid()) {
     low_resolution_hybrid_grid_ =
@@ -266,6 +344,8 @@ void Submap3D::ToResponseProto(
                     response->add_textures());
   AddToTextureProto(*low_resolution_hybrid_grid_, global_submap_pose,
                     response->add_textures());
+  AddToTextureProto(*height_map_hybrid_grid_, global_submap_pose,
+                    response->add_textures(), true);
 }
 
 void Submap3D::InsertData(const sensor::RangeData& range_data_in_local,
@@ -285,6 +365,11 @@ void Submap3D::InsertData(const sensor::RangeData& range_data_in_local,
   range_data_inserter.Insert(transformed_range_data,
                              low_resolution_hybrid_grid_.get(),
                              /*intensity_hybrid_grid=*/nullptr);
+  range_data_inserter.Insert(
+      FilterRangeDataByMaxRange(transformed_range_data,
+                                high_resolution_max_range),
+      height_map_hybrid_grid_.get(),
+      nullptr);
   set_num_range_data(num_range_data() + 1);
   const float yaw_in_submap_from_gravity = transform::GetYaw(
       local_pose().inverse().rotation() * local_from_gravity_aligned);
